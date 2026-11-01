@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.cache_sfx/
+*_edited.mp4
+*.captions.txt
+.DS_Store
+Thumbs.db

@@ -46,12 +46,14 @@ python app.py
    * Tự động nhận diện thông số video (độ phân giải, fps, thời lượng).
    * Cho phép chọn thư mục lưu thành phẩm bất kỳ qua nút **`📂 Chọn Nơi Lưu...`**.
 3. **Các Chế Độ Biên Tập (Workflows)**:
-   * 🌟 **Trọn Gói Tự Động (Hook 30s + Nhịp + Sub Tiếng Anh)**: Tự động phát hiện chuyển cảnh, khóa đoạn cao trào 30s đắt giá nhất, tạo nhịp giật punch zoom và chèn sub tiếng Anh viên thuốc kính mờ.
+   * 🌟 **Trọn Gói Tự Động (Hook 30s + Nhịp + Sub Tiếng Anh)**: Quét chuyển cảnh và độ lớn âm thanh của cả video, chấm điểm mọi đoạn 24-36s (độ lớn, đỉnh âm, độ dồn lên cuối, nhịp cắt, mật độ thoại) để chọn đoạn cao trào. Thêm punch zoom ở mỗi điểm chuyển cảnh, nhấn mạnh tại điểm cao trào (zoom + boom), whoosh theo nhịp cắt và sub tiếng Anh chữ nổi.
    * ✂️ **Tạo Nhịp & Sub Cho Video Cắt Sẵn**: Giữ nguyên toàn bộ thời lượng video đã cắt sẵn, bổ sung nhịp giật visual, hiệu ứng âm thanh và sub.
-   * 🎯 **Chỉ Cắt Hook 30s**: Trích xuất cao trào nhanh mà không can thiệp âm thanh.
-4. **Phụ Đề Tiếng Anh Viên Thuốc Kính Mờ (English Frosted Glass Capsule)**:
-   * Thiết kế chuẩn Safe Zone `Y: 1530` (không bị giao diện TikTok/Reels che khuất).
-   * Tự động xóa sạch/che phủ phụ đề thô cũ nếu có.
+   * 🎯 **Chỉ Cắt Hook 30s**: Chọn đoạn cao trào như trên, giữ nguyên âm thanh gốc, không thêm hiệu ứng.
+4. **Phụ Đề Tiếng Anh Chữ Nổi**:
+   * Chữ trắng đậm, viền đen dày, bóng đổ mềm, không có nền; tự xuống tối đa 2 dòng.
+   * Đặt ở Safe Zone `Y: 1530` (không bị giao diện TikTok/Reels che khuất).
+   * Lưu ý: chữ nổi không che phụ đề cứng có sẵn trong video gốc.
+   * Video ngang hoặc vuông được đặt giữa khung 9:16 trên nền mờ, không bị kéo méo.
 5. **Tiến Trình Thời Gian Thực & Chẩn Đoán %**:
    * Thanh tiến trình mượt mà từ 0% đến 100%.
    * Ô Console Log hiển thị chi tiết nhật ký từng khung hình đang chạy.

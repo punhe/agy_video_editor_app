@@ -47,6 +47,7 @@ python app.py
    * Cho phép chọn thư mục lưu thành phẩm bất kỳ qua nút **`📂 Chọn Nơi Lưu...`**.
 3. **Các Chế Độ Biên Tập (Workflows)**:
    * 🌟 **Trọn Gói Tự Động (Hook 30s + Nhịp + Sub Tiếng Anh)**: Quét chuyển cảnh và độ lớn âm thanh của cả video, chấm điểm mọi đoạn 24-36s (độ lớn, đỉnh âm, độ dồn lên cuối, nhịp cắt, mật độ thoại) để chọn đoạn cao trào. Thêm punch zoom ở mỗi điểm chuyển cảnh, nhấn mạnh tại điểm cao trào (zoom + boom), whoosh theo nhịp cắt và sub tiếng Anh chữ nổi.
+     * **Tự cắt ghép khi video thưa cao trào**: nếu các khoảnh khắc mạnh nằm rải rác (một đoạn liền 30s chứa nhiều khúc nhạt), app chọn các khoảnh khắc mạnh nhất ở khắp video, thêm vài giây dồn trước mỗi cú hit, rồi ghép theo đúng thứ tự thời gian thành hook ~30s. Điểm cắt bám theo đầu/cuối câu thoại hoặc điểm chuyển cảnh, nên không cắt ngang câu. Mỗi mối ghép có punch zoom + whoosh. Video có cao trào tập trung vẫn giữ một đoạn liền. Log ghi rõ: `Mật độ cao trào: đoạn liền X% · cắt ghép Y%`.
    * ✂️ **Tạo Nhịp & Sub Cho Video Cắt Sẵn**: Giữ nguyên toàn bộ thời lượng video đã cắt sẵn, bổ sung nhịp giật visual, hiệu ứng âm thanh và sub.
    * 🎯 **Chỉ Cắt Hook 30s**: Chọn đoạn cao trào như trên, giữ nguyên âm thanh gốc, không thêm hiệu ứng.
 4. **Phụ Đề Tiếng Anh Chữ Nổi**:

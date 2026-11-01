@@ -248,6 +248,122 @@ class VideoEditorEngine:
         return a, b, info
 
     # -------------------------------------------------------------
+    # Montage (cut & join) for sparse videos
+    # -------------------------------------------------------------
+    @staticmethod
+    def intensity_per_second(cut_secs, dur, loud, subs):
+        """0..1-ish 'how much is happening' per second: loudness (peaks emphasised),
+        dialogue and scene-cut density, lightly smoothed."""
+        n = max(len(loud), int(np.ceil(dur)), 1)
+        L = np.zeros(n, dtype=np.float32)
+        L[:len(loud)] = loud
+        talk = np.zeros(n, dtype=np.float32)
+        for s in subs:
+            a, b = int(max(0, s["start"])), int(min(n - 1, np.ceil(s["end"])))
+            if b >= a:
+                talk[a:b + 1] = 1.0
+        cuts = np.zeros(n, dtype=np.float32)
+        for c in cut_secs[1:-1]:
+            k = int(c)
+            if 0 <= k < n:
+                cuts[k] += 1.0
+        k3 = np.ones(3, dtype=np.float32) / 3.0
+        cut_d = np.convolve(cuts, k3, mode='same')
+        if cut_d.max() > 0:
+            cut_d /= cut_d.max()
+        raw = 0.6 * L ** 1.4 + 0.2 * talk + 0.2 * cut_d
+        return np.convolve(raw, k3, mode='same').astype(np.float32)
+
+    @staticmethod
+    def hot_fraction(inten, hot_thr, segments):
+        idx = []
+        for a, b in segments:
+            idx.extend(range(int(a), min(len(inten), int(np.ceil(b)))))
+        if not idx:
+            return 0.0
+        return float((inten[idx] >= hot_thr).mean())
+
+    def pick_montage(self, cut_secs, dur, inten, subs, target=30.0):
+        """
+        Picks the strongest moments anywhere in the video and returns them as
+        chronological pieces [(a, b), ...] totalling about `target` seconds.
+        Piece edges snap to sentence edges (no cut mid-line) or to scene cuts.
+        """
+        cut_arr = np.array(cut_secs[1:-1]) if len(cut_secs) > 2 else np.zeros(0)
+
+        def inside_sub(t):
+            for s in subs:
+                if s["start"] + 0.15 < t < s["end"] - 0.15:
+                    return s
+            return None
+
+        def near_cut(t, lim=1.0):
+            if len(cut_arr) == 0:
+                return None
+            k = int(np.argmin(np.abs(cut_arr - t)))
+            return float(cut_arr[k]) if abs(cut_arr[k] - t) <= lim else None
+
+        def snap_start(t):
+            s = inside_sub(t)
+            if s is not None and t - s["start"] <= 2.5:
+                return max(0.0, s["start"] - 0.1)
+            c = near_cut(t)
+            return max(0.0, c if c is not None else t)
+
+        def snap_end(t):
+            s = inside_sub(t)
+            if s is not None and s["end"] - t <= 3.0:
+                return min(dur, s["end"] + 0.15)
+            c = near_cut(t)
+            return min(dur, c if c is not None else t)
+
+        pieces = []
+        top = float(inten.max()) if len(inten) else 0.0
+        for p in np.argsort(-inten):
+            if sum(b - a for a, b in pieces) >= target - 1.5:
+                break
+            if top <= 0 or inten[p] < 0.25 * top:
+                break
+            if any(a - 1.5 <= p + 0.5 <= b + 1.5 for a, b in pieces):
+                continue
+            a = snap_start(p - 2.0)
+            b = snap_end(p + 3.5)  # lean forward: the hit, then the reaction
+            if b - a > 8.0:
+                b = snap_end(a + 6.0) if snap_end(a + 6.0) - a <= 8.0 else a + 8.0
+            if b - a < 2.0:
+                b = min(dur, a + 2.0)
+            # Merge with neighbours that are almost touching
+            merged = True
+            while merged:
+                merged = False
+                for q in pieces:
+                    if a <= q[1] + 1.5 and b >= q[0] - 1.5:
+                        pieces.remove(q)
+                        a, b = min(a, q[0]), max(b, q[1])
+                        merged = True
+                        break
+            total = sum(x1 - x0 for x0, x1 in pieces)
+            if total + (b - a) > target + 3.0:
+                b = a + max(2.0, target - total)
+            pieces.append((a, b))
+        pieces.sort()
+        # Too short? Give each moment more build-up before the hit (and a bit of reaction after)
+        total = sum(b - a for a, b in pieces)
+        if pieces and target - total > 2.0:
+            per = (target - total) / len(pieces)
+            grown = []
+            for k, (a, b) in enumerate(pieces):
+                prev_end = grown[-1][1] if grown else 0.0
+                next_start = pieces[k + 1][0] if k + 1 < len(pieces) else dur
+                na = max(prev_end + 0.5, min(a, snap_start(a - min(per * 0.65, 4.0))))
+                nb = min(next_start - 0.5, max(b, snap_end(b + min(per * 0.35, 2.5))))
+                grown.append((min(a, na), max(b, nb)))
+            pieces = grown
+        total = sum(b - a for a, b in pieces)
+        info =f"{len(pieces)} đoạn, tổng {total:.1f}s: " + ", ".join(f"{a:.1f}-{b:.1f}s" for a, b in pieces)
+        return pieces, info
+
+    # -------------------------------------------------------------
     # Frame fitting (no stretching)
     # -------------------------------------------------------------
     @staticmethod
@@ -309,7 +425,9 @@ class VideoEditorEngine:
     # Master Processing Execution
     # -------------------------------------------------------------
     def process_video(self, input_path, output_path, mode="hook-and-polish",
-                      sub_mode="en", enable_sfx=True, enable_pacing=True):
+                      sub_mode="en", enable_sfx=True, enable_pacing=True, hook_style="auto"):
+        """hook_style: 'auto' (cut & join only when the climax moments are scattered),
+        'window' (always one continuous piece) or 'montage' (always cut & join)."""
         self._stop_event.clear()
         start_time = time.time()
         self.log(f"=== BẮT ĐẦU XỬ LÝ: {os.path.basename(input_path)} ===")
@@ -349,39 +467,85 @@ class VideoEditorEngine:
         subs_full = self.transcribe_audio(audio16) if sub_mode != "none" else []
         if self.is_cancelled(): return False, "Đã hủy bởi người dùng."
 
-        # Step 3: In/out points
-        in_sec, out_sec = 0.0, dur
+        # Step 3: Source pieces to keep. One continuous window, or (sparse video)
+        # several strong moments cut & joined together.
+        segments = [(0.0, dur)]
         if want_hook:
             self.update_progress(30, "Đang chấm điểm các đoạn để tìm cao trào...")
-            in_sec, out_sec, info = self.pick_hook_window(cut_secs, dur, loud, subs_full)
-            self.log(f"Khóa Hook cao trào: {in_sec:.2f}s -> {out_sec:.2f}s ({out_sec - in_sec:.2f}s) | {info}")
+            w_in, w_out, info = self.pick_hook_window(cut_secs, dur, loud, subs_full)
+            segments = [(w_in, w_out)]
+            style = hook_style if hook_style in ("auto", "window", "montage") else "auto"
+            if style != "window" and dur >= (40.0 if style == "montage" else 60.0):
+                inten = self.intensity_per_second(cut_secs, dur, loud, subs_full)
+                hot_thr = float(np.percentile(inten, 75))
+                pieces, m_info = self.pick_montage(cut_secs, dur, inten, subs_full)
+                wh = self.hot_fraction(inten, hot_thr, segments)
+                mh = self.hot_fraction(inten, hot_thr, pieces) if pieces else 0.0
+                self.log(f"Mật độ cao trào: đoạn liền {wh:.0%} · cắt ghép {mh:.0%}")
+                use_montage = len(pieces) >= 2 and (
+                    style == "montage" or (wh < 0.55 and mh - wh >= 0.20))
+                if use_montage:
+                    segments = pieces
+                    self.log(f"Video thưa cao trào -> CẮT GHÉP {m_info}")
+            if len(segments) == 1:
+                self.log(f"Khóa Hook cao trào: {w_in:.2f}s -> {w_out:.2f}s ({w_out - w_in:.2f}s) | {info}")
         else:
             self.log(f"Chế độ {mode}: Giữ trọn vẹn mạch video ({dur:.2f}s).")
 
-        clip_dur = out_sec - in_sec
-        clip_frames = int(clip_dur * fps)
+        # Output timeline: frame counts per piece keep sound and picture in sync
+        seg_frames = [max(1, int(round((b - a) * fps))) for a, b in segments]
+        seg_offs = [0.0]
+        for nf in seg_frames[:-1]:
+            seg_offs.append(seg_offs[-1] + nf / fps)
+        clip_frames = sum(seg_frames)
+        clip_dur = clip_frames / fps
+        joins = seg_offs[1:]
+        is_montage = len(segments) > 1
+
+        def map_t(t):
+            for (a, _), off, nf in zip(segments, seg_offs, seg_frames):
+                if a <= t <= a + nf / fps:
+                    return off + (t - a)
+            return None
 
         subs = []
         for s in subs_full:
-            if s["end"] > in_sec and s["start"] < out_sec:
-                subs.append({"start": max(0.0, s["start"] - in_sec),
-                             "end": min(clip_dur, s["end"] - in_sec), "text": s["text"]})
+            for (a, _), off, nf in zip(segments, seg_offs, seg_frames):
+                b = a + nf / fps
+                s0, s1 = max(s["start"], a), min(s["end"], b)
+                if s1 - s0 >= 0.4:
+                    subs.append({"start": off + s0 - a, "end": off + s1 - a, "text": s["text"]})
+        subs.sort(key=lambda x: x["start"])
         if sub_mode != "none":
             self.log(f"Đã tạo {len(subs)} câu phụ đề tiếng Anh tự động.")
 
-        # Rhythm points inside the clip
+        # Rhythm points inside the clip (scene cuts + every join of the montage)
         rel_cuts = []
         for c in cut_secs:
-            t = c - in_sec
-            if 0.3 < t < clip_dur - 0.3 and (not rel_cuts or t - rel_cuts[-1] >= 0.8):
+            t = map_t(c)
+            if t is not None and 0.3 < t < clip_dur - 0.3 and (not rel_cuts or t - rel_cuts[-1] >= 0.8):
                 rel_cuts.append(t)
-        clip_loud = loud[int(in_sec):int(np.ceil(out_sec))] if len(loud) else np.zeros(0)
+        for j in joins:
+            if all(abs(j - c) > 0.3 for c in rel_cuts):
+                rel_cuts.append(j)
+        rel_cuts.sort()
+        # Loudness for each second of the OUTPUT timeline
+        clip_loud = np.zeros(0)
+        if len(loud):
+            vals = []
+            for s_out in range(int(clip_dur)):
+                k = int(np.searchsorted(seg_offs, s_out + 0.5, side='right')) - 1
+                src = segments[k][0] + (s_out + 0.5 - seg_offs[k])
+                vals.append(loud[min(len(loud) - 1, int(src))])
+            clip_loud = np.array(vals, dtype=np.float32)
         climax_t = None
         if len(clip_loud) > 4 and clip_dur > 8.0:
             # loudest second, ignoring the first 2 s; snap to a nearby cut if there is one
-            k = int(np.argmax(clip_loud[2:])) + 2
+            tail = clip_loud[2:len(clip_loud) - 2]  # skip first/last 2 s: the boom needs room
+            # near-ties go to the later moment, so the hook builds toward its hit
+            k = int(np.argmax(tail + 0.05 * np.linspace(0.0, 1.0, len(tail)))) + 2
             climax_t = float(k)
-            near = [c for c in rel_cuts if abs(c - climax_t) <= 1.0]
+            near = [c for c in rel_cuts if abs(c - climax_t) <= 1.0 and c <= clip_dur - 1.5]
             if near:
                 climax_t = min(near, key=lambda c: abs(c - climax_t))
         if enable_pacing:
@@ -392,22 +556,33 @@ class VideoEditorEngine:
         self.update_progress(45, "Đang phối âm thanh & hiệu ứng chuyển cảnh...")
         temp_audio_orig = os.path.join(self.cache_dir, f"_temp_orig_{int(time.time())}.wav")
         temp_master_audio = os.path.join(self.cache_dir, f"_temp_master_{int(time.time())}.wav")
-        subprocess.run([
-            'ffmpeg', '-y', '-ss', f"{in_sec:.4f}", '-to', f"{out_sec:.4f}",
-            '-i', input_path, '-vn', '-ac', '2', '-ar', '44100', temp_audio_orig
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-        try:
-            with wave.open(temp_audio_orig, 'rb') as wf:
-                sr = wf.getframerate()
-                orig_audio = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
-                if wf.getnchannels() == 2:
-                    orig_audio = orig_audio.reshape(-1, 2)
-                else:
-                    orig_audio = np.column_stack([orig_audio, orig_audio])
-        except Exception:
-            sr = 44100
-            orig_audio = np.zeros((int(clip_dur * sr), 2), dtype=np.float32)
+        sr = 44100
+        pieces_audio = []
+        has_audio = False
+        fade_n = int(0.012 * sr)  # tiny fade at joins, avoids clicks
+        for (a, _), nf in zip(segments, seg_frames):
+            need = int(round(nf / fps * sr))
+            subprocess.run([
+                'ffmpeg', '-y', '-ss', f"{a:.4f}", '-t', f"{nf / fps:.4f}",
+                '-i', input_path, '-vn', '-ac', '2', '-ar', str(sr), temp_audio_orig
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                with wave.open(temp_audio_orig, 'rb') as wf:
+                    pa = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
+                    pa = pa.reshape(-1, 2) if wf.getnchannels() == 2 else np.column_stack([pa, pa])
+                has_audio = True
+            except Exception:
+                pa = np.zeros((0, 2), dtype=np.float32)
+            if len(pa) < need:
+                pa = np.vstack([pa, np.zeros((need - len(pa), 2), dtype=np.float32)])
+            pa = pa[:need].copy()
+            if is_montage and len(pa) > 2 * fade_n:
+                ramp = np.linspace(0.0, 1.0, fade_n, dtype=np.float32)[:, None]
+                pa[:fade_n] *= ramp
+                pa[-fade_n:] *= ramp[::-1]
+            pieces_audio.append(pa)
+        orig_audio = np.vstack(pieces_audio) if pieces_audio else np.zeros((int(clip_dur * sr), 2), dtype=np.float32)
+        if not has_audio:
             self.log("Video không có âm thanh, dùng nền im lặng.")
 
         total_audio_samples = len(orig_audio)
@@ -435,7 +610,8 @@ class VideoEditorEngine:
             for c in rel_cuts:
                 if climax_t is not None and abs(c - climax_t) < 1.5:
                     continue
-                if c - last >= 4.0:
+                is_join = any(abs(c - j) < 0.05 for j in joins)
+                if c - last >= 4.0 or (is_join and c - last >= 1.2):
                     _mix(whoosh_data, c - whoosh_lead, 0.28)
                     last = c
                     placed += 1
@@ -540,8 +716,7 @@ class VideoEditorEngine:
         # Step 6: Render
         self.update_progress(60, f"Đang render video ({encoder})...")
         cap = cv2.VideoCapture(input_path)
-        cap.set(cv2.CAP_PROP_POS_MSEC, in_sec * 1000.0)
-        fit = self.make_fitter(specs['width'], specs['height'], target_w, target_h)
+        fit =self.make_fitter(specs['width'], specs['height'], target_w, target_h)
 
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
@@ -557,6 +732,11 @@ class VideoEditorEngine:
         ]
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
+        # Frame i of the output -> (piece start in source, first output frame of that piece)
+        seg_first = np.cumsum([0] + seg_frames[:-1])
+        seg_idx = 0
+        last_raw = None
+        cap.set(cv2.CAP_PROP_POS_MSEC, segments[0][0] * 1000.0)
         for i in range(clip_frames):
             if self.is_cancelled():
                 proc.stdin.close()
@@ -564,8 +744,16 @@ class VideoEditorEngine:
                 cap.release()
                 return False, "Đã hủy bởi người dùng."
 
+            if seg_idx + 1 < len(segments) and i >= seg_first[seg_idx + 1]:
+                seg_idx += 1
+                cap.set(cv2.CAP_PROP_POS_MSEC, segments[seg_idx][0] * 1000.0)
             ret, frame = cap.read()
-            if not ret: break
+            if not ret:
+                if last_raw is None:
+                    break
+                frame = last_raw.copy()  # hold the last frame so audio stays in sync
+            else:
+                last_raw = frame
             t = i / fps
 
             # 1. Fit to 1080x1920 without stretching

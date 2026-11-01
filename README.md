@@ -6,19 +6,33 @@
 
 ## 🚀 1. Cách Khởi Chạy Ứng Dụng
 
-### Trên Windows:
-* Cách 1: **Click đúp vào file `run_app.bat`**.
-* Cách 2: Mở terminal gõ:
-  ```cmd
-  python app.py
-  ```
+### Cần cài trước
+* **Python 3.9 trở lên**, tải tại https://www.python.org/downloads/ (bản này có sẵn Tkinter).
+* **ffmpeg** để cắt và xuất video:
+  * macOS: `brew install ffmpeg`
+  * Windows: `winget install Gyan.FFmpeg`
+
+Thư viện Python (`opencv-python`, `numpy`, `Pillow`, `faster-whisper`) được file chạy **tự cài** vào thư mục `.venv` ở lần mở đầu tiên. Lần đầu mất vài phút. Các lần sau app mở ngay.
 
 ### Trên macOS:
 * Cách 1: **Click đúp vào file `run_app.command`**.
-* Cách 2: Mở Terminal gõ:
+* Cách 2: Mở Terminal trong thư mục app và gõ:
   ```bash
-  python3 app.py
+  bash run_app.sh
   ```
+* Nếu báo thiếu Tkinter khi dùng Python của Homebrew: chạy `brew install python-tk@3.13` (thay `3.13` bằng phiên bản Python của bạn).
+
+### Trên Windows:
+* Cách 1: **Click đúp vào file `run_app.bat`**.
+* Cách 2: Mở terminal trong thư mục app và gõ `run_app.bat`.
+
+### Cài thủ công (nếu không dùng file chạy)
+```bash
+python3 -m venv .venv
+source .venv/bin/activate      # Windows: .venv\Scripts\activate
+pip install -r requirements.txt faster-whisper
+python app.py
+```
 
 ---
 

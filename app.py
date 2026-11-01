@@ -7,7 +7,7 @@ Features:
 - Smart RAM & Concurrency Resource Allocation
 - Auto X/Twitter Spicy Caption Generator (x-shortdrama-caption standard)
 - AGY CLI Google Account Authentication Bridge
-- Cross-platform for Windows & macOS (Zero pip requirements)
+- Cross-platform for Windows & macOS (packages in requirements.txt, auto-installed by run_app.*)
 
 UI: sidebar navigation, shared settings column, collapsible log drawer.
 """
@@ -23,6 +23,19 @@ from tkinter import ttk, filedialog, messagebox
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 if CURRENT_DIR not in sys.path:
     sys.path.insert(0, CURRENT_DIR)
+
+_missing = []
+for _mod, _pkg in (("cv2", "opencv-python"), ("numpy", "numpy"), ("PIL", "Pillow")):
+    try:
+        __import__(_mod)
+    except ImportError:
+        _missing.append(_pkg)
+if _missing:
+    _launcher = "run_app.bat" if sys.platform == "win32" else "bash run_app.sh"
+    print("Thiếu thư viện Python: " + ", ".join(_missing))
+    print(f"Cách sửa: chạy app bằng '{_launcher}' (tự cài thư viện),")
+    print("hoặc cài thủ công:  python3 -m pip install -r requirements.txt")
+    sys.exit(1)
 
 from core.agy_connector import find_agy_executable, test_agy_connection, launch_login_terminal
 from core.notifier import send_notification, reveal_in_file_manager, open_media_file

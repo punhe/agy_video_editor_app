@@ -5,3 +5,4 @@ __pycache__/
 *.captions.txt
 .DS_Store
 Thumbs.db
+.venv/

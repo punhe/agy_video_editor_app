@@ -1320,6 +1320,14 @@ class AGYShortDramaStudio(tk.Tk):
 
 def main():
     app = AGYShortDramaStudio()
+    if sys.platform == "darwin":
+        # Apps started from Terminal open behind it on macOS: bring the window forward once.
+        def _bring_to_front():
+            app.lift()
+            app.attributes("-topmost", True)
+            app.after(300, lambda: app.attributes("-topmost", False))
+            app.focus_force()
+        app.after(200, _bring_to_front)
     app.mainloop()
 
 

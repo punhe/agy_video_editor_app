@@ -16,6 +16,8 @@ import wave
 from PIL import Image, ImageDraw, ImageFont
 
 class VideoEditorEngine:
+    _agy_broken = False  # set after the first AGY failure so a batch doesn't wait on it every video
+
     def __init__(self, log_callback=None, progress_callback=None):
         self.log_callback = log_callback or (lambda text: print(text))
         self.progress_callback = progress_callback or (lambda pct, msg: None)
@@ -110,25 +112,42 @@ class VideoEditorEngine:
 
         cuts = [0]
         prev_hist = None
+        prev_gray = None
         frame_idx = 0
+        n_sec = max(1, int(np.ceil(total_frames / fps)) + 1)
+        motion_sum = np.zeros(n_sec, dtype=np.float32)
+        motion_cnt = np.zeros(n_sec, dtype=np.float32)
 
         while cap.isOpened() and not self.is_cancelled():
+            if frame_idx % 2 == 1:
+                # skip decode-to-BGR on odd frames (only every 2nd frame is analysed)
+                if not cap.grab(): break
+                frame_idx += 1
+                continue
             ret, frame = cap.read()
             if not ret: break
-            if frame_idx % 2 == 0:
-                small = cv2.resize(frame, (180, 320))
-                hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
-                hist = cv2.calcHist([hsv], [0, 1], None, [30, 32], [0, 180, 0, 256])
-                cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
-                if prev_hist is not None:
-                    diff = cv2.compareHist(prev_hist, hist, cv2.HISTCMP_BHATTACHARYYA)
-                    if diff > 0.40:
-                        cuts.append(frame_idx)
-                prev_hist = hist
+            small = cv2.resize(frame, (180, 320))
+            hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+            hist = cv2.calcHist([hsv], [0, 1], None, [30, 32], [0, 180, 0, 256])
+            cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
+            gray = cv2.GaussianBlur(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY), (5, 5), 0)
+            is_cut = False
+            if prev_hist is not None:
+                diff = cv2.compareHist(prev_hist, hist, cv2.HISTCMP_BHATTACHARYYA)
+                if diff > 0.40:
+                    cuts.append(frame_idx)
+                    is_cut = True
+            if prev_gray is not None and not is_cut:
+                # Motion inside a shot (people moving, shaking camera), not the cut itself
+                s = min(n_sec - 1, int(frame_idx / fps))
+                motion_sum[s] += float(cv2.absdiff(gray, prev_gray).mean())
+                motion_cnt[s] += 1
+            prev_hist, prev_gray = hist, gray
             frame_idx += 1
         cap.release()
         if cuts[-1] != total_frames:
             cuts.append(total_frames)
+        self.last_motion = motion_sum / np.maximum(motion_cnt, 1)
         return cuts, fps, total_frames
 
     # -------------------------------------------------------------
@@ -162,6 +181,141 @@ class VideoEditorEngine:
             return np.full(n, 0.5, dtype=np.float32)
         return np.clip((db - lo) / (hi - lo), 0.0, 1.0).astype(np.float32)
 
+    @staticmethod
+    def _rolling_median(x, win):
+        if len(x) == 0:
+            return x
+        win = max(3, min(win, len(x) | 1))
+        pad = win // 2
+        xp = np.pad(x, pad, mode='edge')
+        view = np.lib.stride_tricks.sliding_window_view(xp, win)
+        return np.median(view, axis=1)[:len(x)]
+
+    @staticmethod
+    def _spikes(x, base_win=21):
+        """How far each second rises above its own surroundings, 0..1 (short bursts)."""
+        if len(x) == 0:
+            return np.zeros(0, dtype=np.float32)
+        base = VideoEditorEngine._rolling_median(x, base_win)
+        rise = x - base
+        scale = np.percentile(rise, 97) if np.percentile(rise, 97) > 1e-6 else (rise.max() or 1.0)
+        return np.clip(rise / scale, 0.0, 1.0).astype(np.float32)
+
+    @staticmethod
+    def _rise(x):
+        """How far each second sits above the video's typical level, 0..1.
+        Unlike _spikes this also keeps long climaxes (10-40 s) high."""
+        if len(x) == 0:
+            return np.zeros(0, dtype=np.float32)
+        x = np.asarray(x, dtype=np.float32)
+        med = float(np.median(x))
+        scale = float(np.percentile(x, 98)) - med
+        if scale <= 1e-6:
+            return np.zeros(len(x), dtype=np.float32)
+        return np.clip((x - med) / scale, 0.0, 1.0).astype(np.float32)
+
+    def audio_features(self, audio, sr=16000):
+        """Per-second climax cues from the soundtrack, all 0..1:
+        surprise = loudness above the local background (not absolute loudness),
+        shout = 1.5-4 kHz energy above background (raised voices, screams),
+        impact = sharp transients (slaps, hits, crashes, stingers),
+        quiet = near-silent seconds."""
+        n = len(audio) // sr
+        z = np.zeros(max(n, 0), dtype=np.float32)
+        if n <= 0:
+            return {"surprise": z, "shout": z, "impact": z, "quiet": z}
+        fl = 512                      # 32 ms frames, 31 per second
+        per = sr // fl
+        freqs = np.fft.rfftfreq(fl, 1.0 / sr)
+        hi_band = (freqs >= 1500) & (freqs <= 4000)
+        win = np.hanning(fl).astype(np.float32)
+        db_s, hi_s, flux_s = np.zeros(n), np.zeros(n), np.zeros(n)
+        prev_last = None
+        step = 300                    # seconds per chunk keeps memory small
+        for s0 in range(0, n, step):
+            s1 = min(n, s0 + step)
+            blk = audio[s0 * sr:s1 * sr].reshape(s1 - s0, sr)[:, :per * fl]
+            frames = blk.reshape(-1, fl) * win
+            mag = np.abs(np.fft.rfft(frames, axis=1)).astype(np.float32)
+            pw = mag ** 2
+            e_all = pw.sum(axis=1).reshape(s1 - s0, per)
+            e_hi = pw[:, hi_band].sum(axis=1).reshape(s1 - s0, per)
+            lm = np.log1p(mag)
+            if prev_last is None:
+                prev_last = lm[:1]
+            d = np.diff(np.vstack([prev_last, lm]), axis=0)
+            prev_last = lm[-1:]
+            flux = np.maximum(d, 0).sum(axis=1).reshape(s1 - s0, per)
+            db_s[s0:s1] = 10 * np.log10(e_all.mean(axis=1) + 1e-9)
+            hi_s[s0:s1] = 10 * np.log10(np.percentile(e_hi, 90, axis=1) + 1e-9)
+            flux_s[s0:s1] = flux.max(axis=1)
+        quiet = (db_s < np.median(db_s) - 15.0).astype(np.float32)  # real silence only
+        return {
+            # loudness: half "sudden jump", half "above the usual level" (a loud theme
+            # song alone is not enough)
+            "surprise": 0.5 * self._spikes(db_s) + 0.5 * np.minimum(self._rise(db_s), self._spikes(db_s, 61) + 0.3),
+            "shout": self._rise(hi_s),
+            "impact": np.maximum(self._rise(flux_s), self._spikes(flux_s, base_win=15)),
+            "quiet": quiet,
+        }
+
+    def llm_climax_ranges(self, subs, dur):
+        """Asks AGY CLI (if installed and logged in) to read the dialogue and name the
+        most dramatic moments. Returns [(start, end, reason), ...]; [] on any failure."""
+        if len(subs) < 4:
+            return []
+        try:
+            from core.agy_connector import find_agy_executable
+            agy = find_agy_executable()
+        except Exception:
+            agy = None
+        if not agy:
+            return []
+        lines, size = [], 0
+        for s in subs:
+            ln = f"[{s['start']:.1f}-{s['end']:.1f}] {s['text']}"
+            size += len(ln)
+            if size > 14000:
+                break
+            lines.append(ln)
+        prompt = (
+            "You are a short-drama (vertical drama) editor choosing the climax for a 30-second hook.\n"
+            f"Video length: {dur:.0f}s. Timestamped dialogue (any language):\n" + "\n".join(lines) + "\n\n"
+            "Pick the 3 most dramatic moments: confrontation, slap or fight, shocking reveal, "
+            "humiliation then comeback, shouting, crying, cliffhanger. Skip greetings, small talk, recaps "
+            "and calm exposition. Each moment 5-25 seconds, using the timestamps above.\n"
+            'Answer ONLY with JSON: [{"start": 12.0, "end": 30.5, "why": "short reason"}, ...] '
+            "best first."
+        )
+        if VideoEditorEngine._agy_broken:
+            return []
+        try:
+            res = subprocess.run(
+                [agy, "-p", prompt, "--mode", "plan", "--effort", "low",
+                 "--disable-slash-commands", "--print-timeout", "100s"],
+                capture_output=True, text=True, timeout=130, encoding="utf-8", errors="replace",
+                stdin=subprocess.DEVNULL, cwd=self.cache_dir)
+            out = res.stdout or ""
+            if "print timeout" in (res.stderr or "") + out and "[" not in out:
+                raise subprocess.TimeoutExpired("agy", 100)
+            import json, re
+            m = re.search(r"\[\s*\{.*?\}\s*\]", out, re.S)
+            if not m:
+                VideoEditorEngine._agy_broken = True
+                self.log("[AGY] Không có câu trả lời (chưa đăng nhập AGY?). Dùng phân tích âm thanh/hình.")
+                return []
+            ranges = []
+            for it in json.loads(m.group(0))[:3]:
+                a, b = float(it.get("start", 0)), float(it.get("end", 0))
+                if 0 <= a < b <= dur + 1:
+                    ranges.append((a, min(b, dur), str(it.get("why", ""))[:80]))
+            return ranges
+        except Exception as e:
+            VideoEditorEngine._agy_broken = True
+            hint = " Bấm 'Đăng nhập Google' trong app để bật AI chọn cao trào." if isinstance(e, subprocess.TimeoutExpired) else ""
+            self.log(f"[AGY] Bỏ qua bước AI đọc thoại ({e.__class__.__name__}).{hint}")
+            return []
+
     def transcribe_audio(self, audio):
         if len(audio) == 0:
             return []
@@ -188,91 +342,94 @@ class VideoEditorEngine:
     # -------------------------------------------------------------
     # Climax (hook) selection
     # -------------------------------------------------------------
-    def pick_hook_window(self, cut_secs, dur, loud, subs, ideal=30.0, lo=24.0, hi=36.0):
+    def pick_hook_window(self, cut_secs, dur, inten, ideal=30.0, lo=24.0, hi=36.0):
         """
-        Scores every cut-aligned window of 24-36 s and returns the best (in_sec, out_sec, info).
-        Score favours: loud passages, a strong peak, a build-up toward the end,
-        fast cutting, and dense dialogue. Ties no longer fall back to the first window.
+        Scores every cut-aligned window of 24-36 s on the climax intensity curve and
+        returns (in_sec, out_sec, info, top3). A window wins by being intense overall,
+        containing the strongest seconds, and building toward its end.
         """
         import bisect
-
-        n_sec = len(loud)
-        talk = np.zeros(max(n_sec, int(np.ceil(dur)) + 1), dtype=np.float32)
-        for s in subs:
-            a, b = int(max(0, s["start"])), int(min(len(talk) - 1, np.ceil(s["end"])))
-            talk[a:b + 1] = 1.0
-
         candidates = []
-        for i, a in enumerate(cut_secs):
+        for a in cut_secs:
             j0 = bisect.bisect_left(cut_secs, a + lo)
             j1 = bisect.bisect_right(cut_secs, a + hi)
             for j in range(j0, j1):
                 candidates.append((a, cut_secs[j]))
-        if not candidates:
-            # Too few scene cuts: slide a 30 s window second by second
-            step = 1.0
+        if len(candidates) < 5:
+            # Too few scene cuts: also slide a 30 s window second by second
             t = 0.0
             while t + ideal <= dur:
                 candidates.append((t, t + ideal))
-                t += step
+                t += 1.0
         if not candidates:
-            return 0.0, dur, "video ngắn hơn cửa sổ hook"
+            return 0.0, dur, "video ngắn hơn cửa sổ hook", []
 
-        cut_arr = np.array(cut_secs)
-        rows = []
+        n = len(inten)
+        scored = []
         for a, b in candidates:
-            ia, ib = int(a), max(int(a) + 1, int(np.ceil(b)))
-            seg = loud[ia:ib] if n_sec else np.zeros(1)
+            ia, ib = int(a), min(n, max(int(a) + 1, int(np.ceil(b))))
+            seg = inten[ia:ib] if ia < n else np.zeros(1)
             if len(seg) == 0:
                 seg = np.zeros(1)
             mean_e = float(seg.mean())
-            peak = float(np.sort(seg)[-3:].mean())
+            top = float(np.sort(seg)[-5:].mean())
             third = max(1, len(seg) // 3)
             build = float(np.clip(seg[-third:].mean() - seg[:third].mean(), 0, 1))
-            n_cuts = int(((cut_arr > a + 0.2) & (cut_arr < b - 0.2)).sum())
-            rate = n_cuts / (b - a)
-            dialog = float(talk[ia:ib].mean()) if subs else 0.0
             closeness = abs((b - a) - ideal) / (hi - lo)
-            rows.append((a, b, mean_e, peak, build, rate, dialog, closeness))
-
-        max_rate = max(r[5] for r in rows) or 1.0
-        best, best_score = None, -1e9
-        for a, b, mean_e, peak, build, rate, dialog, closeness in rows:
-            score = (0.32 * mean_e + 0.28 * peak + 0.12 * build +
-                     0.18 * (rate / max_rate) + 0.10 * dialog - 0.05 * closeness)
-            if score > best_score:
-                best_score, best = score, (a, b, mean_e, peak, rate)
-        a, b, mean_e, peak, rate = best
-        info = (f"điểm {best_score:.2f} · độ lớn TB {mean_e:.2f} · đỉnh {peak:.2f} · "
-                f"{rate * 10:.1f} cảnh/10s · xét {len(rows)} đoạn")
-        return a, b, info
+            score = 0.45 * mean_e + 0.38 * top + 0.12 * build - 0.05 * closeness
+            scored.append((score, a, b, mean_e, top))
+        scored.sort(reverse=True)
+        top3 = []
+        for row in scored:
+            if all(row[2] <= t[1] or row[1] >= t[2] for t in top3):
+                top3.append(row)
+            if len(top3) == 3:
+                break
+        score, a, b, mean_e, top = scored[0]
+        info = f"điểm {score:.2f} · cường độ TB {mean_e:.2f} · đỉnh {top:.2f} · xét {len(scored)} đoạn"
+        return a, b, info, top3
 
     # -------------------------------------------------------------
-    # Montage (cut & join) for sparse videos
+    # Climax intensity + montage (cut & join) for sparse videos
     # -------------------------------------------------------------
-    @staticmethod
-    def intensity_per_second(cut_secs, dur, loud, subs):
-        """0..1-ish 'how much is happening' per second: loudness (peaks emphasised),
-        dialogue and scene-cut density, lightly smoothed."""
-        n = max(len(loud), int(np.ceil(dur)), 1)
-        L = np.zeros(n, dtype=np.float32)
-        L[:len(loud)] = loud
-        talk = np.zeros(n, dtype=np.float32)
+    def intensity_per_second(self, cut_secs, dur, feats, motion, subs, llm_ranges=()):
+        """Per-second 'something big is happening' score, built from cues that rise ABOVE
+        the scene's own background: sudden loudness, raised voices, impacts, sudden motion,
+        heated fast dialogue; plus a boost on the moments the AI picked from the dialogue."""
+        n = max(int(np.ceil(dur)), 1)
+
+        def fit(x):
+            out = np.zeros(n, dtype=np.float32)
+            if x is not None and len(x):
+                m = min(n, len(x))
+                out[:m] = x[:m]
+            return out
+
+        surprise, shout, impact = fit(feats.get("surprise")), fit(feats.get("shout")), fit(feats.get("impact"))
+        quiet = fit(feats.get("quiet"))
+        mot = fit(self._rise(motion)) if motion is not None and len(motion) else np.zeros(n, np.float32)
+
+        heated = np.zeros(n, dtype=np.float32)
         for s in subs:
+            d = max(0.3, s["end"] - s["start"])
+            wps = len(s["text"].split()) / d if " " in s["text"].strip() else len(s["text"]) / d / 3.0
+            v = min(1.0, wps / 4.0) * 0.6 + (0.4 if any(ch in s["text"] for ch in "!！?？") else 0.0)
             a, b = int(max(0, s["start"])), int(min(n - 1, np.ceil(s["end"])))
             if b >= a:
-                talk[a:b + 1] = 1.0
-        cuts = np.zeros(n, dtype=np.float32)
-        for c in cut_secs[1:-1]:
-            k = int(c)
-            if 0 <= k < n:
-                cuts[k] += 1.0
+                heated[a:b + 1] = np.maximum(heated[a:b + 1], v)
+
+        raw = (0.27 * surprise + 0.23 * shout + 0.18 * impact + 0.17 * mot + 0.15 * heated)
+        raw *= (1.0 - 0.6 * quiet)
         k3 = np.ones(3, dtype=np.float32) / 3.0
-        cut_d = np.convolve(cuts, k3, mode='same')
-        if cut_d.max() > 0:
-            cut_d /= cut_d.max()
-        raw = 0.6 * L ** 1.4 + 0.2 * talk + 0.2 * cut_d
-        return np.convolve(raw, k3, mode='same').astype(np.float32)
+        inten = np.convolve(raw, k3, mode='same')
+        mx = float(inten.max())
+        if mx > 0:
+            inten /= mx
+        for rank, (a, b, _) in enumerate(llm_ranges):
+            ia, ib = int(max(0, a)), int(min(n, np.ceil(b)))
+            inten[ia:ib] += (0.55, 0.45, 0.35)[rank]
+        inten[:2] *= 0.6  # opening logo / title card
+        return inten.astype(np.float32)
 
     @staticmethod
     def hot_fraction(inten, hot_thr, segments):
@@ -322,7 +479,7 @@ class VideoEditorEngine:
         for p in np.argsort(-inten):
             if sum(b - a for a, b in pieces) >= target - 1.5:
                 break
-            if top <= 0 or inten[p] < 0.25 * top:
+            if top <= 0 or inten[p] < 0.55 * top:
                 break
             if any(a - 1.5 <= p + 0.5 <= b + 1.5 for a, b in pieces):
                 continue
@@ -460,25 +617,37 @@ class VideoEditorEngine:
             self.log(f"Đã phát hiện {max(0, len(cut_secs) - 2)} điểm chuyển cảnh.")
         if self.is_cancelled(): return False, "Đã hủy bởi người dùng."
 
-        # Step 2: Audio loudness + dialogue (whole video, used for choosing the climax)
+        # Step 2: Sound cues + dialogue (whole video, used for choosing the climax)
         self.update_progress(18, "Đang phân tích âm thanh & nhận diện thoại...")
         audio16 = self.extract_audio_16k(input_path)
-        loud = self.loudness_per_second(audio16)
-        subs_full = self.transcribe_audio(audio16) if sub_mode != "none" else []
+        feats = self.audio_features(audio16)
+        dialog = self.transcribe_audio(audio16) if (sub_mode != "none" or want_hook) else []
+        subs_full = dialog if sub_mode != "none" else []
         if self.is_cancelled(): return False, "Đã hủy bởi người dùng."
+
+        llm_ranges = []
+        if want_hook:
+            self.update_progress(26, "AI đang đọc lời thoại để tìm khúc gay cấn...")
+            llm_ranges = self.llm_climax_ranges(dialog, dur)
+            for a, b, why in llm_ranges:
+                self.log(f"[AGY] Cao trào theo lời thoại: {a:.1f}s -> {b:.1f}s · {why}")
+        motion = getattr(self, "last_motion", None) if (want_hook or enable_pacing) else None
+        inten = self.intensity_per_second(cut_secs, dur, feats, motion, dialog, llm_ranges)
+        loud = inten  # the climax hit inside the clip follows the same curve
 
         # Step 3: Source pieces to keep. One continuous window, or (sparse video)
         # several strong moments cut & joined together.
         segments = [(0.0, dur)]
         if want_hook:
             self.update_progress(30, "Đang chấm điểm các đoạn để tìm cao trào...")
-            w_in, w_out, info = self.pick_hook_window(cut_secs, dur, loud, subs_full)
+            w_in, w_out, info, top3 = self.pick_hook_window(cut_secs, dur, inten)
+            for r, (sc, a, b, me, tp) in enumerate(top3, 1):
+                self.log(f"  Ứng viên #{r}: {a:.1f}s -> {b:.1f}s · điểm {sc:.2f} (TB {me:.2f}, đỉnh {tp:.2f})")
             segments = [(w_in, w_out)]
             style = hook_style if hook_style in ("auto", "window", "montage") else "auto"
             if style != "window" and dur >= (40.0 if style == "montage" else 60.0):
-                inten = self.intensity_per_second(cut_secs, dur, loud, subs_full)
-                hot_thr = float(np.percentile(inten, 75))
-                pieces, m_info = self.pick_montage(cut_secs, dur, inten, subs_full)
+                hot_thr = float(np.percentile(inten, 80))
+                pieces, m_info = self.pick_montage(cut_secs, dur, inten, dialog)
                 wh = self.hot_fraction(inten, hot_thr, segments)
                 mh = self.hot_fraction(inten, hot_thr, pieces) if pieces else 0.0
                 self.log(f"Mật độ cao trào: đoạn liền {wh:.0%} · cắt ghép {mh:.0%}")
